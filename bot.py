@@ -41,18 +41,30 @@ def handle_slip_image(message):
         if result.get("status") == 200 or result.get("status") == "success":
             data = result.get("data", {})
             
-            # ดึงข้อมูลรายละเอียดครบถ้วน
+            # ดึงยอดเงิน
             amount = data.get('amount', {}).get('amount', data.get('amount', 0))
             sender = data.get('sender', {})
             receiver = data.get('receiver', {})
             
+            # ดึงชื่อผู้โอนและผู้รับ
             sender_name = sender.get('account', {}).get('name', {}).get('th', sender.get('name', 'ไม่ระบุ'))
             receiver_name = receiver.get('account', {}).get('name', {}).get('th', receiver.get('name', 'ไม่ระบุ'))
             
-            sender_bank = sender.get('bank', 'ไม่ระบุ')
-            receiver_bank = receiver.get('bank', 'ไม่ระบุ')
+            # จัดการแปลงค่าธนาคารไม่ให้หลุดเป็นก้อน Dictionary
+            sender_bank_raw = sender.get('bank', 'ไม่ระบุ')
+            if isinstance(sender_bank_raw, dict):
+                sender_bank = sender_bank_raw.get('name', 'ไม่ระบุ')
+            else:
+                sender_bank = sender_bank_raw
+
+            receiver_bank_raw = receiver.get('bank', 'ไม่ระบุ')
+            if isinstance(receiver_bank_raw, dict):
+                receiver_bank = receiver_bank_raw.get('name', 'ไม่ระบุ')
+            else:
+                receiver_bank = receiver_bank_raw
             
-            trans_date = data.get('transDate', 'ไม่ระบุ')
+            # ดึงวัน-เวลาที่โอน (รองรับหลายฟิลด์ที่ API ส่งมา)
+            trans_date = data.get('date', data.get('transDate', 'ไม่ระบุ'))
             trans_time = data.get('transTime', '')
 
             reply_text = (
