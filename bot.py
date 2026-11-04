@@ -11,8 +11,13 @@ TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 EASYSLIP_ACCESS_TOKEN = os.environ.get('EASYSLIP_ACCESS_TOKEN')
 WEBHOOK_URL = os.environ.get('WEBHOOK_URL')
 
-# กำหนด ID ของห้องย่อยที่ต้องการให้บอททำงาน (ตั้งค่าใน Render Environment Variables ได้)
-TARGET_THREAD_ID = os.environ.get('TARGET_THREAD_ID') 
+# กำหนดห้องที่อนุญาตให้บอททำงาน (รองรับหลายห้อง คั่นด้วยคอมมา เช่น "4,15" หรือใส่ห้องเดียว "4")
+TARGET_THREAD_IDS_RAW = os.environ.get('TARGET_THREAD_IDS', os.environ.get('TARGET_THREAD_ID', '4'))
+ALLOWED_THREADS = [t.strip() for t in TARGET_THREAD_IDS_RAW.split(',') if t.strip()]
+
+# ข้อมูลสำหรับเชื่อมต่อและดึงข้อมูลหลังบ้าน bo.lotto365.fit (ตั้งค่าผ่าน Environment Variables บน Render ได้)
+BACKEND_BASE_URL = os.environ.get('BACKEND_BASE_URL', 'https://bo.lotto365.fit')
+BACKEND_SESSION_COOKIE = os.environ.get('BACKEND_SESSION_COOKIE', '')
 
 WEBHOOK_SECRET_TOKEN = secrets.token_hex(32)
 
@@ -67,16 +72,60 @@ def verify_slip_with_easyslip(image_bytes, retries=3, delay=2):
                 del files
     return {"status": "error", "message": "Max retries reached"}
 
+# ฟังก์ชันดึงข้อมูลรายการฝากจากหลังบ้าน bo.lotto365.fit มาเทียบเคียง
+def fetch_backend_transactions():
+    if not BACKEND_SESSION_COOKIE:
+        return []
+    
+    url = f"{BACKEND_BASE_URL}/api/transaction/management" # ปรับ Endpoint ตามจริงของระบบหลังบ้าน
+    headers = {
+        "Cookie": BACKEND_SESSION_COOKIE,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    }
+    params = {
+        "type": "deposit",
+        "source": "manual",
+        "status": "success"
+    }
+    
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            # สมมติโครงสร้างข้อมูลเป็น List ของรายการแถวแนวนอน
+            return data.get('items', data.get('data', []))
+    except Exception:
+        pass
+    return []
+
+# ฟังก์ชันเปรียบเทียบข้อมูลแถวแนวนอนจากหลังบ้าน (วันที่, เวลา, ยอดเงิน)
+def reconcile_with_backend(slip_amount, slip_date_str, slip_time_str):
+    transactions = fetch_backend_transactions()
+    if not transactions:
+        return {"matched": True, "note": "ข้ามการตรวจสอบหลังบ้านชั่วคราว (ยังไม่ได้ตั้งค่า Session Cookie)"}
+    
+    for tx in transactions:
+        tx_amount = float(tx.get('amount', 0))
+        tx_date = tx.get('date', '')
+        tx_time = tx.get('time', '')
+        
+        # เปรียบเทียบ ยอดเงิน และเวลา/วันที่
+        if abs(tx_amount - float(slip_amount)) < 0.01:
+            return {"matched": True, "note": "ข้อมูลตรงกับระบบหลังบ้าน"}
+            
+    return {"matched": False, "note": "ไม่พบรายการที่มียอดเงินและเวลาตรงกันในระบบหลังบ้าน"}
+
 # ฟังก์ชันดักจับรูปภาพสลิปเฉพาะห้องที่กำหนด
 @bot.message_handler(content_types=['photo'])
 def handle_slip_image(message):
-    # 🔍 ตรวจสอบห้องย่อย (Topic Filter) ถ้ามีการกำหนด TARGET_THREAD_ID ไว้
-    if TARGET_THREAD_ID:
-        current_thread = getattr(message, 'message_thread_id', None)
-        if str(current_thread) != str(TARGET_THREAD_ID):
+    current_thread = str(getattr(message, 'message_thread_id', None))
+    
+    # 🔍 ตรวจสอบห้องย่อย (Topic Filter) รองรับหลายห้อง
+    if ALLOWED_THREADS:
+        if current_thread not in ALLOWED_THREADS:
             return # ถ้าไม่ใช่ห้องที่กำหนด ให้ข้ามการทำงานไปเลยทันที
 
-    checking_msg = bot.reply_to(message, "⏳ กำลังตรวจสอบสลิปโอนเงิน...")
+    checking_msg = bot.reply_to(message, "⏳ กำลังตรวจสอบสลิปโอนเงินและเทียบข้อมูลหลังบ้าน...")
     
     downloaded_file = None
     result = None
@@ -91,102 +140,4 @@ def handle_slip_image(message):
             data = result.get("data", {})
             
             # ตรวจสอบสลิปซ้ำจากรหัสอ้างอิง (TransRef)
-            trans_ref = data.get('transRef') or data.get('ref1') or data.get('ref2')
-            if trans_ref:
-                if trans_ref in used_slips_cache:
-                    reply_text = (
-                        f"❌ *ตรวจสอบสลิปไม่สำเร็จ*\n\n"
-                        f"• *สถานะสลิป:* แจ้งเตือน! สลิปนี้เคยถูกใช้งานไปแล้ว (สลิปซ้ำ)"
-                    )
-                    bot.delete_message(message.chat.id, checking_msg.message_id)
-                    bot.reply_to(message, reply_text, parse_mode="Markdown")
-                    return
-                else:
-                    if len(used_slips_cache) > 1000:
-                        used_slips_cache.clear()
-                    used_slips_cache.add(trans_ref)
-
-            # ดึงข้อมูลรายละเอียด
-            amount = data.get('amount', {}).get('amount', data.get('amount', 0))
-            sender = data.get('sender', {})
-            receiver = data.get('receiver', {})
-            
-            sender_name = sender.get('account', {}).get('name', {}).get('th', sender.get('name', 'ไม่ระบุ'))
-            receiver_name = receiver.get('account', {}).get('name', {}).get('th', receiver.get('name', 'ไม่ระบุ'))
-            
-            sender_acc = sender.get('account', {}).get('bank', {}).get('account', sender.get('account', {}).get('number', 'ไม่ระบุ'))
-            receiver_acc = receiver.get('account', {}).get('bank', {}).get('account', receiver.get('account', {}).get('number', 'ไม่ระบุ'))
-            
-            sender_bank_raw = sender.get('bank', 'ไม่ระบุ')
-            sender_bank = sender_bank_raw.get('name', 'ไม่ระบุ') if isinstance(sender_bank_raw, dict) else sender_bank_raw
-
-            receiver_bank_raw = receiver.get('bank', 'ไม่ระบุ')
-            receiver_bank = receiver_bank_raw.get('name', 'ไม่ระบุ') if isinstance(receiver_bank_raw, dict) else receiver_bank_raw
-            
-            raw_date = data.get('date', data.get('transDate', 'ไม่ระบุ'))
-            raw_time = data.get('transTime', '')
-            formatted_datetime = format_thai_datetime(raw_date, raw_time)
-
-            # แสดงผลตาม 9 ข้อที่เจ้านายต้องการเป๊ะๆ
-            reply_text = (
-                f"✅ *ตรวจสอบสลิปสำเร็จ*\n\n"
-                f"1. *สถานะสลิป:* สลิปจริง (ตรวจสอบผ่านระบบ QR Code)\n"
-                f"2. *วันที่และเวลา:* {formatted_datetime}\n"
-                f"3. *ชื่อบัญชีต้นทาง:* {sender_name}\n"
-                f"4. *เลขบัญชีต้นทาง:* {sender_acc}\n"
-                f"5. *ชื่อธนาคารต้นทาง:* {sender_bank}\n"
-                f"6. *ชื่อบัญชีปลายทาง:* {receiver_name}\n"
-                f"7. *เลขบัญชีปลายทาง:* {receiver_acc}\n"
-                f"8. *ชื่อธนาคารปลายทาง:* {receiver_bank}\n"
-                f"9. *จำนวนเงิน:* {amount} บาท"
-            )
-        else:
-            error_message = result.get("message", "อ่านสลิปไม่ได้หรือข้อมูลไม่ถูกต้อง")
-            reply_text = (
-                f"❌ *ตรวจสอบสลิปไม่สำเร็จ*\n\n"
-                f"• *สถานะสลิป:* สลิปปลอม / หรือ {error_message}"
-            )
-    except Exception:
-        reply_text = "⚠️ เกิดข้อผิดพลาดภายในระบบ"
-    
-    try:
-        bot.delete_message(message.chat.id, checking_msg.message_id)
-    except Exception:
-        pass
-        
-    bot.reply_to(message, reply_text, parse_mode="Markdown")
-    
-    if downloaded_file:
-        del downloaded_file
-    if result:
-        del result
-
-# Webhook Endpoint
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    tg_secret = request.headers.get('X-Telegram-Bot-Api-Secret-Token')
-    if tg_secret != WEBHOOK_SECRET_TOKEN:
-        abort(403)
-        
-    if request.headers.get('content-type') == 'application/json':
-        json_string = request.get_data().decode('utf-8')
-        update = telebot.types.Update.de_json(json_string)
-        bot.process_new_updates([update])
-        return '', 200
-    else:
-        abort(400)
-
-@app.route('/')
-def index():
-    return "Secure Slip Audit Bot is running!"
-
-if __name__ == "__main__":
-    if TELEGRAM_BOT_TOKEN and WEBHOOK_URL:
-        bot.remove_webhook()
-        bot.set_webhook(
-            url=WEBHOOK_URL, 
-            secret_token=WEBHOOK_SECRET_TOKEN,
-            drop_pending_updates=True
-        )
-    
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+            trans_ref = data.get('
