@@ -67,7 +67,7 @@ def verify_slip_with_easyslip(image_bytes, retries=3, delay=2):
                 del files
     return {"status": "error", "message": "Max retries reached"}
 
-# ฟังก์ชันดักจับรูปภาพสลิปเฉพาะห้องที่กำหนด
+# ฟังก์ชันดักจับรูปภาพสลิปเฉพาะห้องที่กำหนด และต้องมีคำสั่ง /ตรวจ ในแคปชัน
 @bot.message_handler(content_types=['photo'])
 def handle_slip_image(message):
     # 🔍 ตรวจสอบห้องย่อย (Topic Filter) ถ้ามีการกำหนด TARGET_THREAD_ID ไว้
@@ -75,6 +75,11 @@ def handle_slip_image(message):
         current_thread = getattr(message, 'message_thread_id', None)
         if str(current_thread) != str(TARGET_THREAD_ID):
             return # ถ้าไม่ใช่ห้องที่กำหนด ให้ข้ามการทำงานไปเลยทันที
+
+    # 📌 ตรวจสอบว่าในแคปชันมีคำว่า /ตรวจ หรือไม่ ถ้าไม่มีจะไม่ทำงาน
+    caption = message.caption or ""
+    if not caption.strip().startswith('/ตรวจ'):
+        return
 
     checking_msg = bot.reply_to(message, "⏳ กำลังตรวจสอบสลิปโอนเงิน...")
     
