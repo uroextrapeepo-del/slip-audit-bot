@@ -1,6 +1,7 @@
 import os
 import secrets
 import time
+from datetime import datetime
 import telebot
 import requests
 from flask import Flask, request, abort
@@ -17,6 +18,30 @@ app = Flask(__name__)
 
 # เก็บประวัติ TransRef ของสลิปที่เคยตรวจแล้ว เพื่อป้องกันการใช้สลิปซ้ำ (Duplicate Check)
 used_slips_cache = set()
+
+# ฟังก์ชันแปลงรูปแบบวันที่และเวลาให้เป็น DD/MM/YYYY HH:MM (ปีพุทธศักราช)
+def format_thai_datetime(date_str, time_str):
+    try:
+        # รองรับกรณีที่ API ส่งวันที่มาแบบ YYYY-MM-DD หรือ YYYY-MM-DDTHH:MM:SS
+        if 'T' in date_str:
+            dt_obj = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+            day = dt_obj.strftime('%d')
+            month = dt_obj.strftime('%m')
+            year_th = dt_obj.year + 543
+            formatted_time = dt_obj.strftime('%H:%M')
+            return f"{day}/{month}/{year_th} {formatted_time}"
+        elif date_str and date_str != 'ไม่ระบุ':
+            # หากเป็นรูปแบบปกติ
+            parts = date_str.split('-')
+            if len(parts) == 3:
+                y, m, d = parts[0], parts[1], parts[2]
+                year_th = int(y) + 543
+                return f"{d}/{m}/{year_th} {time_str}".strip()
+    except Exception:
+        pass
+    
+    # ถ้าแปลงไม่สำเร็จ ให้แสดงค่าดิบที่มี
+    return f"{date_str} {time_str}".strip()
 
 # ฟังก์ชันตรวจสอบสลิป พร้อมระบบลองส่งซ้ำอัตโนมัติ (Retry Mechanism)
 def verify_slip_with_easyslip(image_bytes, retries=3, delay=2):
@@ -78,16 +103,16 @@ def handle_slip_image(message):
                     bot.reply_to(message, reply_text, parse_mode="Markdown")
                     return
                 else:
-                    # บันทึกรหัสอ้างอิงลงในแคช (จำกัดขนาดไม่ให้เมมเต็มเกินไป)
                     if len(used_slips_cache) > 1000:
                         used_slips_cache.clear()
                     used_slips_cache.add(trans_ref)
 
-            # ดึงข้อมูลรายละเอียด
+            # ดึงข้อมูลยอดเงิน
             amount = data.get('amount', {}).get('amount', data.get('amount', 0))
             sender = data.get('sender', {})
             receiver = data.get('receiver', {})
             
+            # ดึงชื่อ-นามสกุล
             sender_name = sender.get('account', {}).get('name', {}).get('th', sender.get('name', 'ไม่ระบุ'))
             receiver_name = receiver.get('account', {}).get('name', {}).get('th', receiver.get('name', 'ไม่ระบุ'))
             
@@ -95,19 +120,30 @@ def handle_slip_image(message):
             sender_acc = sender.get('account', {}).get('bank', {}).get('account', sender.get('account', {}).get('number', 'ไม่ระบุ'))
             receiver_acc = receiver.get('account', {}).get('bank', {}).get('account', receiver.get('account', {}).get('number', 'ไม่ระบุ'))
             
-            # วัน-เวลาที่โอน
-            trans_date = data.get('date', data.get('transDate', 'ไม่ระบุ'))
-            trans_time = data.get('transTime', '')
+            # ดึงชื่อธนาคาร
+            sender_bank_raw = sender.get('bank', 'ไม่ระบุ')
+            sender_bank = sender_bank_raw.get('name', 'ไม่ระบุ') if isinstance(sender_bank_raw, dict) else sender_bank_raw
 
-            # จัดเรียงลำดับใหม่ตามที่เจ้านายต้องการ
+            receiver_bank_raw = receiver.get('bank', 'ไม่ระบุ')
+            receiver_bank = receiver_bank_raw.get('name', 'ไม่ระบุ') if isinstance(receiver_bank_raw, dict) else receiver_bank_raw
+            
+            # วัน-เวลาที่โอน (จัดรูปแบบใหม่)
+            raw_date = data.get('date', data.get('transDate', 'ไม่ระบุ'))
+            raw_time = data.get('transTime', '')
+            formatted_datetime = format_thai_datetime(raw_date, raw_time)
+
+            # จัดเรียงลำดับใหม่ตามที่เจ้านายสั่ง 9 ข้อเป๊ะๆ
             reply_text = (
                 f"✅ *ตรวจสอบสลิปสำเร็จ*\n\n"
-                f"1. *สถานะสลิป:* สลิปสแกนติดผ่าน (สลิปจริง)\n"
-                f"2. *เลขบัญชีต้นทาง:* {sender_acc}\n"
-                f"3. *เลขบัญชีปลายทาง:* {receiver_acc}\n"
-                f"4. *วันที่และเวลา:* {trans_date} {trans_time}\n"
-                f"5. *ชื่อ-นามสกุล:* โอนจาก {sender_name} ถึง {receiver_name}\n"
-                f"6. *จำนวนเงิน:* {amount} บาท"
+                f"1. *สถานะสลิป:* สลิปจริง (ตรวจสอบผ่านระบบ QR Code)\n"
+                f"2. *วันที่และเวลา:* {formatted_datetime}\n"
+                f"3. *ชื่อบัญชีต้นทาง:* {sender_name}\n"
+                f"4. *เลขบัญชีต้นทาง:* {sender_acc}\n"
+                f"5. *ชื่อธนาคารต้นทาง:* {sender_bank}\n"
+                f"6. *ชื่อบัญชีปลายทาง:* {receiver_name}\n"
+                f"7. *เลขบัญชีปลายทาง:* {receiver_acc}\n"
+                f"8. *ชื่อธนาคารปลายทาง:* {receiver_bank}\n"
+                f"9. *จำนวนเงิน:* {amount} บาท"
             )
         else:
             error_message = result.get("message", "อ่านสลิปไม่ได้หรือข้อมูลไม่ถูกต้อง")
