@@ -19,8 +19,9 @@ WEBHOOK_SECRET_TOKEN = secrets.token_hex(32)
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, threaded=False)
 app = Flask(__name__)
 
-# เก็บประวัติ TransRef ของสลิปที่เคยตรวจแล้ว เพื่อป้องกันการใช้สลิปซ้ำ
+# เก็บประวัติ TransRef ป้องกันสลิปซ้ำ และเก็บรูปภาพล่าสุดแยกตามห้อง (Thread ID)
 used_slips_cache = set()
+latest_photos_cache = {}
 
 # ฟังก์ชันแปลงรูปแบบวันที่และเวลาให้เป็น DD/MM/YYYY HH:MM (ปีพุทธศักราช)
 def format_thai_datetime(date_str, time_str):
@@ -67,27 +68,44 @@ def verify_slip_with_easyslip(image_bytes, retries=3, delay=2):
                 del files
     return {"status": "error", "message": "Max retries reached"}
 
-# ฟังก์ชันดักจับรูปภาพสลิปเฉพาะห้องที่กำหนด และต้องมีคำสั่ง /ตรวจ ในแคปชัน
+# 1. ดักจับรูปภาพที่ถูกส่งเข้ามา แล้วบันทึกเก็บไว้ชั่วคราวตามห้อง
 @bot.message_handler(content_types=['photo'])
-def handle_slip_image(message):
-    # 🔍 ตรวจสอบห้องย่อย (Topic Filter) ถ้ามีการกำหนด TARGET_THREAD_ID ไว้
+def handle_incoming_photo(message):
+    current_thread = str(getattr(message, 'message_thread_id', None))
+    
     if TARGET_THREAD_ID:
-        current_thread = getattr(message, 'message_thread_id', None)
         if str(current_thread) != str(TARGET_THREAD_ID):
-            return # ถ้าไม่ใช่ห้องที่กำหนด ให้ข้ามการทำงานไปเลยทันที
+            return
 
-    # 📌 ตรวจสอบว่าในแคปชันมีคำว่า /ตรวจ หรือไม่ ถ้าไม่มีจะไม่ทำงาน
-    caption = message.caption or ""
-    if not caption.strip().startswith('/ตรวจ'):
+    # บันทึก file_id ของรูปล่าสุดในห้องนี้ไว้
+    file_id = message.photo[-1].file_id
+    latest_photos_cache[current_thread] = file_id
+    
+    # ส่งสติ๊กเกอร์หรือข้อความสั้นๆ บอกว่าจำรูปนี้ไว้แล้ว (หรือจะไม่ส่งก็ได้ เพื่อความเงียบเรียบร้อย)
+    # bot.reply_to(message, "📌 บันทึกรูปสลิปนี้ไว้แล้ว พิมพ์ /ตรวจ เพื่อเริ่มตรวจสอบได้เลยครับ")
+
+# 2. ดักจับข้อความตัวหนังสือ เมื่อพิมพ์ /ตรวจ ให้ดึงรูปล่าสุดมาตรวจสอบ
+@bot.message_handler(func=lambda message: message.text and message.text.strip().startswith('/ตรวจ'))
+def handle_check_command(message):
+    current_thread = str(getattr(message, 'message_thread_id', None))
+    
+    if TARGET_THREAD_ID:
+        if str(current_thread) != str(TARGET_THREAD_ID):
+            return
+
+    # เช็กดูว่ามีรูปสลิปถูกส่งมาก่อนหน้านี้ในห้องนี้ไหม
+    if current_thread not in latest_photos_cache:
+        bot.reply_to(message, "⚠️ ยังไม่พบรูปสลิปในห้องนี้ กรุณาส่งรูปสลิปมาก่อน แล้วค่อยพิมพ์ /ตรวจ ครับ")
         return
 
-    checking_msg = bot.reply_to(message, "⏳ กำลังตรวจสอบสลิปโอนเงิน...")
+    file_id = latest_photos_cache[current_thread]
+    checking_msg = bot.reply_to(message, "⏳ กำลังตรวจสอบสลิปโอนเงินจากรูปที่ส่งมาก่อนหน้า...")
     
     downloaded_file = None
     result = None
     
     try:
-        file_info = bot.get_file(message.photo[-1].file_id)
+        file_info = bot.get_file(file_id)
         downloaded_file = bot.download_file(file_info.file_path)
         
         result = verify_slip_with_easyslip(downloaded_file)
@@ -95,7 +113,6 @@ def handle_slip_image(message):
         if result.get("status") == 200 or result.get("status") == "success":
             data = result.get("data", {})
             
-            # ตรวจสอบสลิปซ้ำจากรหัสอ้างอิง (TransRef)
             trans_ref = data.get('transRef') or data.get('ref1') or data.get('ref2')
             if trans_ref:
                 if trans_ref in used_slips_cache:
@@ -111,7 +128,6 @@ def handle_slip_image(message):
                         used_slips_cache.clear()
                     used_slips_cache.add(trans_ref)
 
-            # ดึงข้อมูลรายละเอียด
             amount = data.get('amount', {}).get('amount', data.get('amount', 0))
             sender = data.get('sender', {})
             receiver = data.get('receiver', {})
@@ -132,7 +148,6 @@ def handle_slip_image(message):
             raw_time = data.get('transTime', '')
             formatted_datetime = format_thai_datetime(raw_date, raw_time)
 
-            # แสดงผลตาม 9 ข้อที่เจ้านายต้องการเป๊ะๆ
             reply_text = (
                 f"✅ *ตรวจสอบสลิปสำเร็จ*\n\n"
                 f"1. *สถานะสลิป:* สลิปจริง (ตรวจสอบผ่านระบบ QR Code)\n"
@@ -183,7 +198,7 @@ def webhook():
 
 @app.route('/')
 def index():
-    return "Secure Slip Audit Bot is running!"
+    return "Secure Slip Audit Bot (Separate Message) is running!"
 
 if __name__ == "__main__":
     if TELEGRAM_BOT_TOKEN and WEBHOOK_URL:
