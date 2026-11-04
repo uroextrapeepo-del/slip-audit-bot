@@ -4,20 +4,17 @@ import telebot
 import requests
 from flask import Flask, request, abort
 
-# ดึงค่าจาก Environment Variables บน Render
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 EASYSLIP_ACCESS_TOKEN = os.environ.get('EASYSLIP_ACCESS_TOKEN')
 WEBHOOK_URL = os.environ.get('WEBHOOK_URL')
 
 WEBHOOK_SECRET_TOKEN = secrets.token_hex(32)
 
-# กำหนด threaded=False เพื่อความเสถียรบน Webhook
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, threaded=False)
 app = Flask(__name__)
 
-# ฟังก์ชันตรวจสอบสลิปกับ EasySlip API
 def verify_slip_with_easyslip(image_bytes):
-    url = "https://api.easyslip.com/v1/verify" # ใช้ Endpoint มาตรฐานของ EasySlip
+    url = "https://api.easyslip.com/v1/verify"
     headers = {"Authorization": f"Bearer {EASYSLIP_ACCESS_TOKEN}"}
     files = {"file": ("slip.jpg", image_bytes, "image/jpeg")}
     try:
@@ -26,11 +23,9 @@ def verify_slip_with_easyslip(image_bytes):
     except Exception:
         return {"status": "error", "message": "Connection error"}
     finally:
-        # เคลียร์หน่วยความจำหลังใช้งานเสร็จทันที
         del image_bytes
         if 'files' in locals(): del files
 
-# ฟังก์ชันดักจับรูปภาพสลิปที่ส่งเข้ามาในแชท/กลุ่ม
 @bot.message_handler(content_types=['photo'])
 def handle_slip_image(message):
     checking_msg = bot.reply_to(message, "⏳ กำลังตรวจสอบสลิปโอนเงิน...")
@@ -43,25 +38,38 @@ def handle_slip_image(message):
         downloaded_file = bot.download_file(file_info.file_path)
         result = verify_slip_with_easyslip(downloaded_file)
 
-        # EasySlip API ส่งสถานะสำเร็จเป็น 200 หรือ "success"
         if result.get("status") == 200 or result.get("status") == "success":
             data = result.get("data", {})
-            sender_name = data.get('sender', {}).get('account', {}).get('name', {}).get('th', data.get('sender', {}).get('name', 'ไม่ระบุ'))
-            receiver_name = data.get('receiver', {}).get('account', {}).get('name', {}).get('th', data.get('receiver', {}).get('name', 'ไม่ระบุ'))
-            amount = data.get('amount', {}).get('amount', data.get('amount', 0))
             
+            # ดึงข้อมูลรายละเอียดครบถ้วน
+            amount = data.get('amount', {}).get('amount', data.get('amount', 0))
+            sender = data.get('sender', {})
+            receiver = data.get('receiver', {})
+            
+            sender_name = sender.get('account', {}).get('name', {}).get('th', sender.get('name', 'ไม่ระบุ'))
+            receiver_name = receiver.get('account', {}).get('name', {}).get('th', receiver.get('name', 'ไม่ระบุ'))
+            
+            sender_bank = sender.get('bank', 'ไม่ระบุ')
+            receiver_bank = receiver.get('bank', 'ไม่ระบุ')
+            
+            trans_date = data.get('transDate', 'ไม่ระบุ')
+            trans_time = data.get('transTime', '')
+
             reply_text = (
                 f"✅ *ตรวจสอบสลิปสำเร็จ*\n\n"
-                f"• *ยอดเงินที่โอน:* {amount} บาท\n"
-                f"• *ผู้โอน:* {sender_name}\n"
-                f"• *ผู้รับโอน:* {receiver_name}\n"
-                f"• *สถานะ:* สลิปแท้ถูกต้องตามระบบ"
+                f"• *ยอดเงินที่โอน (Amount):* {amount} บาท\n"
+                f"• *ชื่อผู้โอน (Sender Name):* {sender_name}\n"
+                f"• *ชื่อผู้รับโอน (Receiver Name):* {receiver_name}\n"
+                f"• *ธนาคารต้นทาง (Sending Bank):* {sender_bank}\n"
+                f"• *ธนาคารปลายทาง (Receiving Bank):* {receiver_bank}\n"
+                f"• *วัน-เวลาที่โอน (Timestamp):* {trans_date} {trans_time}\n"
+                f"• *สถานะสลิป:* สลิปจริง"
             )
         else:
-            error_message = result.get("message", "อ่านสลิปไม่ได้หรือข้อมูลไม่ถูกต้อง")
+            error_message = result.get("message", "อ่านสลิปไม่ได้")
             reply_text = (
                 f"❌ *ตรวจสอบสลิปไม่สำเร็จ*\n\n"
-                f"• *เหตุผล:* {error_message}"
+                f"• *สถานะสลิป:* สลิปปลอม / สลิปซ้ำ หรือ {error_message}"
             )
     except Exception:
         reply_text = "⚠️ เกิดข้อผิดพลาดภายในระบบ"
@@ -78,7 +86,6 @@ def handle_slip_image(message):
     if result:
         del result
 
-# ระบบ Webhook สำหรับรับข้อมูลจาก Telegram
 @app.route('/webhook', methods=['POST'])
 def webhook():
     tg_secret = request.headers.get('X-Telegram-Bot-Api-Secret-Token')
@@ -93,7 +100,6 @@ def webhook():
     else:
         abort(400)
 
-# หน้าแรกสำหรับให้ Render คอย Ping เช็กสถานะเว็บ
 @app.route('/')
 def index():
     return "Secure Slip Audit Bot is running!"
