@@ -49,7 +49,6 @@ def fetch_google_sheet_data():
     if not GOOGLE_SHEET_ID:
         return None
     try:
-        # เติมพารามิเตอร์รันไทม์สุ่มเพื่อป้องกันติด CSV Cache ของ Google Sheet
         url = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/gviz/tq?tqx=out:csv&sheet={GOOGLE_SHEET_NAME}&t={time.time()}"
         df = pd.read_csv(url)
         return df
@@ -57,52 +56,60 @@ def fetch_google_sheet_data():
         print(f"Error fetching sheet: {e}")
         return None
 
-# ฟังก์ชันเทียบแถวที่ปรับปรุงการอ่านจำนวนเงินให้แม่นยำไร้ที่ติ
+# ฟังก์ชันเทียบแถว พร้อมระบบพิมพ์ Debug ลง Log เพื่อตรวจสอบค่าที่บอทอ่านได้
 def match_sheet_row(df, slip_amount, slip_time_hm):
     if df is None or df.empty:
+        print("DEBUG: DataFrame is empty or None")
         return None, "ไม่สามารถดึงข้อมูลจาก Google Sheet ได้"
     
-    # แปลงยอดเงินจากสลิปให้เป็นตัวเลขกลมๆ หรือทศนิยมสองตำแหน่งที่แน่นอน
     try:
         clean_slip_amount = round(float(slip_amount), 2)
     except Exception:
         clean_slip_amount = 0.0
 
+    print(f"DEBUG SEARCH -> Target Amount: {clean_slip_amount}, Target Time: {slip_time_hm}")
+
     for idx, row in df.iterrows():
         try:
-            # 1. ตรวจสอบจำนวนเงิน (คอลัมน์ I / Index 8) - ทำความสะอาดตัวอักษรและคอมมาออกให้หมด
+            # ดึงค่าคอลัมน์ I (จำนวนเงิน - Index 8) และ คอลัมน์ B (เวลา - Index 1)
             raw_amount_str = str(row.iloc[8]).replace(',', '').strip() if len(row) > 8 else "0"
-            sheet_amount = round(float(raw_amount_str), 2) if raw_amount_str.replace('.', '', 1).isdigit() else 0.0
-            
-            # เปรียบเทียบยอดเงินว่าตรงกันไหม (ยอมรับความคลาดเคลื่อนไม่เกิน 0.01)
-            if abs(sheet_amount - clean_slip_amount) > 0.01:
-                continue 
-            
-            # 2. ตรวจสอบเวลาจากข้อความในคอลัมน์ B (Index 1)
             col_b_text = str(row.iloc[1]) if len(row) > 1 else ""
             
-            # ค้นหาเวลาในรูปแบบ HH:MM ทั้งหมดในช่องนั้น
+            # ทำความสะอาดตัวเลขจำนวนเงิน
+            clean_amount_val = re.sub(r'[^\d.]', '', raw_amount_str)
+            sheet_amount = round(float(clean_amount_val), 2) if clean_amount_val else 0.0
+            
+            # ค้นหาเวลา HH:MM ในข้อความคอลัมน์ B
             all_times = re.findall(r'(\d{2}:\d{2})', col_b_text)
             
-            # ถ้าเวลา HH:MM ตรงกัน
-            if slip_time_hm in all_times:
-                row_number = idx + 2 # หมายเลขแถวใน Google Sheet จริง
+            # พิมพ์ข้อมูลทุกแถวที่กำลังเช็กขึ้น Render Logs เพื่อดูว่าอ่านค่าได้ถูกต้องไหม
+            if idx < 30: # ป้องกัน Log ยาวเกินไป พิมพ์ดู 30 แถวแรก
+                print(f"Row {idx+2} | Col B: '{col_b_text}' | Times Found: {all_times} | Amount: {sheet_amount}")
+
+            # เช็กเงื่อนไข: ยอดเงินตรงกัน และ มีเวลา HH:MM ตรงกัน
+            amount_matched = abs(sheet_amount - clean_slip_amount) <= 0.01
+            time_matched = slip_time_hm in all_times
+
+            if amount_matched and time_matched:
+                row_number = idx + 2 
+                print(f"MATCH FOUND AT ROW {row_number}!")
                 
                 matched_data = {
                     "row_num": row_number,
-                    "user_id": str(row.iloc[2]) if len(row) > 2 else "-",           # คอลัมน์ C: ไอดี
-                    "username": str(row.iloc[3]) if len(row) > 3 else "-",          # คอลัมน์ D: ชื่อสมาชิก
-                    "acc_name": str(row.iloc[4]) if len(row) > 4 else "-",          # คอลัมน์ E: ชื่อบัญชีในระบบ
-                    "amount": raw_amount_str,                                        # คอลัมน์ I: จำนวนเงิน
-                    "type": str(row.iloc[7]) if len(row) > 7 else "-",              # คอลัมน์ H: ประเภท
-                    "status": str(row.iloc[9]) if len(row) > 9 else "-",            # คอลัมน์ J: สถานะ
-                    "creator": str(row.iloc[13]) if len(row) > 13 else "-",         # คอลัมน์ N: ผู้สร้างรายการ
-                    "approver": str(row.iloc[14]) if len(row) > 14 else "-"         # คอลัมน์ O: ผู้ตรวจสอบ
+                    "user_id": str(row.iloc[2]) if len(row) > 2 else "-",
+                    "username": str(row.iloc[3]) if len(row) > 3 else "-",
+                    "acc_name": str(row.iloc[4]) if len(row) > 4 else "-",
+                    "amount": raw_amount_str,
+                    "type": str(row.iloc[7]) if len(row) > 7 else "-",
+                    "status": str(row.iloc[9]) if len(row) > 9 else "-",
+                    "creator": str(row.iloc[13]) if len(row) > 13 else "-",
+                    "approver": str(row.iloc[14]) if len(row) > 14 else "-"
                 }
                 return matched_data, "ปกติ"
-        except Exception:
+        except Exception as e:
             continue
             
+    print("DEBUG: No matching row found in entire sheet.")
     return None, "กรุณาตรวจสอบ"
 
 def verify_slip_with_easyslip(image_bytes, retries=3, delay=2):
@@ -264,7 +271,7 @@ def webhook():
 
 @app.route('/')
 def index():
-    return "Secure Slip Audit Bot with Anti-Cache Sheet Sync is running!"
+    return "Secure Slip Audit Bot with Detailed Log Debug is running!"
 
 if __name__ == "__main__":
     if TELEGRAM_BOT_TOKEN and WEBHOOK_URL:
