@@ -1,9 +1,11 @@
 import os
 import secrets
 import time
+import re
 from datetime import datetime
 import telebot
 import requests
+import pandas as pd
 from flask import Flask, request, abort
 
 # ดึงค่าจาก Environment Variables บน Render
@@ -11,19 +13,21 @@ TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 EASYSLIP_ACCESS_TOKEN = os.environ.get('EASYSLIP_ACCESS_TOKEN')
 WEBHOOK_URL = os.environ.get('WEBHOOK_URL')
 
-# กำหนด ID ของห้องย่อยที่ต้องการให้บอททำงาน (ตั้งค่าใน Render Environment Variables ได้)
 TARGET_THREAD_ID = os.environ.get('TARGET_THREAD_ID') 
+
+# ตั้งค่า Google Sheet ID และ Sheet Name
+GOOGLE_SHEET_ID = os.environ.get('GOOGLE_SHEET_ID')
+GOOGLE_SHEET_NAME = os.environ.get('GOOGLE_SHEET_NAME', 'LOTTO365AUDIT')
 
 WEBHOOK_SECRET_TOKEN = secrets.token_hex(32)
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, threaded=False)
 app = Flask(__name__)
 
-# เก็บประวัติ TransRef ป้องกันสลิปซ้ำ และเก็บรูปภาพล่าสุดแยกตามห้อง (Thread ID)
 used_slips_cache = set()
 latest_photos_cache = {}
 
-# ฟังก์ชันแปลงรูปแบบวันที่และเวลาให้เป็น DD/MM/YYYY HH:MM (ปีพุทธศักราช)
+# แปลงวันที่-เวลา เป็น พ.ศ. DD/MM/YYYY HH:MM
 def format_thai_datetime(date_str, time_str):
     try:
         if 'T' in date_str:
@@ -43,7 +47,60 @@ def format_thai_datetime(date_str, time_str):
         pass
     return f"{date_str} {time_str}".strip()
 
-# ฟังก์ชันตรวจสอบสลิป พร้อมระบบลองส่งซ้ำอัตโนมัติ (Retry Mechanism)
+# ฟังก์ชันดึงข้อมูลทั้งหมดจาก Google Sheet ผ่าน CSV Export
+def fetch_google_sheet_data():
+    if not GOOGLE_SHEET_ID:
+        return None
+    try:
+        url = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/gviz/tq?tqx=out:csv&sheet={GOOGLE_SHEET_NAME}"
+        df = pd.read_csv(url)
+        return df
+    except Exception as e:
+        print(f"Error fetching sheet: {e}")
+        return None
+
+# ฟังก์ชันค้นหาและจับคู่แถวใน Google Sheet
+def match_sheet_row(df, slip_amount, slip_time_hm):
+    if df is None or df.empty:
+        return None, "ไม่สามารถดึงข้อมูลจาก Google Sheet ได้"
+    
+    # วนลูปตรวจทุกแถวใน Google Sheet (ไม่จำกัดจำนวนแถว)
+    for idx, row in df.iterrows():
+        try:
+            # 1. ตรวจสอบยอดเงิน (คอลัมน์ I / จำนวนเงิน)
+            raw_amount = str(row.iloc[8]).replace(',', '').strip() if len(row) > 8 else "0"
+            sheet_amount = float(raw_amount) if raw_amount.replace('.', '', 1).isdigit() else 0.0
+            
+            if abs(sheet_amount - float(slip_amount)) > 0.01:
+                continue # ยอดเงินไม่ตรง ข้ามไปแถวถัดไป
+            
+            # 2. ตรวจสอบเวลาจากข้อความในคอลัมน์ B (เช่น ฝากเข้า05 พ.ย. 26 11:50:xx)
+            col_b_text = str(row.iloc[1]) if len(row) > 1 else ""
+            
+            # ใช้ Regular Expression ดึงเวลา HH:MM เช่น 11:50 จากข้อความ
+            time_match = re.search(r'(\d{2}:\d{2})', col_b_text)
+            if time_match:
+                sheet_time_hm = time_match.group(1)
+                
+                # ถ้า ยอดเงินตรง และ เวลา (HH:MM) ตรงกันเป๊ะ
+                if sheet_time_hm == slip_time_hm:
+                    matched_data = {
+                        "user_id": str(row.iloc[2]) if len(row) > 2 else "-",           # คอลัมน์ C: ไอดี
+                        "username": str(row.iloc[3]) if len(row) > 3 else "-",          # คอลัมน์ D: ชื่อสมาชิก
+                        "acc_name": str(row.iloc[4]) if len(row) > 4 else "-",          # คอลัมน์ E: ชื่อบัญชีในระบบ
+                        "amount": raw_amount,                                            # คอลัมน์ I: จำนวนเงิน
+                        "type": str(row.iloc[7]) if len(row) > 7 else "-",              # คอลัมน์ H: ประเภท
+                        "status": str(row.iloc[9]) if len(row) > 9 else "-",            # คอลัมน์ J: สถานะ
+                        "creator": str(row.iloc[13]) if len(row) > 13 else "-",         # คอลัมน์ N: ผู้สร้างรายการ
+                        "approver": str(row.iloc[14]) if len(row) > 14 else "-"          # คอลัมน์ O: ผู้ตรวจสอบ
+                    }
+                    return matched_data, "ปกติ"
+        except Exception:
+            continue
+            
+    return None, "กรุณาตรวจสอบ"
+
+# ฟังก์ชันเรียก EasySlip API
 def verify_slip_with_easyslip(image_bytes, retries=3, delay=2):
     url = "https://api.easyslip.com/v1/verify"
     headers = {"Authorization": f"Bearer {EASYSLIP_ACCESS_TOKEN}"}
@@ -68,38 +125,29 @@ def verify_slip_with_easyslip(image_bytes, retries=3, delay=2):
                 del files
     return {"status": "error", "message": "Max retries reached"}
 
-# 1. ดักจับรูปภาพที่ถูกส่งเข้ามา แล้วบันทึกเก็บไว้ชั่วคราวตามห้อง
+# 1. ดักจับรูปสลิป
 @bot.message_handler(content_types=['photo'])
 def handle_incoming_photo(message):
     current_thread = str(getattr(message, 'message_thread_id', None))
+    if TARGET_THREAD_ID and str(current_thread) != str(TARGET_THREAD_ID):
+        return
     
-    if TARGET_THREAD_ID:
-        if str(current_thread) != str(TARGET_THREAD_ID):
-            return
-
-    # บันทึก file_id ของรูปล่าสุดในห้องนี้ไว้
     file_id = message.photo[-1].file_id
     latest_photos_cache[current_thread] = file_id
-    
-    # ส่งสติ๊กเกอร์หรือข้อความสั้นๆ บอกว่าจำรูปนี้ไว้แล้ว (หรือจะไม่ส่งก็ได้ เพื่อความเงียบเรียบร้อย)
-    # bot.reply_to(message, "📌 บันทึกรูปสลิปนี้ไว้แล้ว พิมพ์ /ตรวจ เพื่อเริ่มตรวจสอบได้เลยครับ")
 
-# 2. ดักจับข้อความตัวหนังสือ เมื่อพิมพ์ /ตรวจ ให้ดึงรูปล่าสุดมาตรวจสอบ
+# 2. ดักจับคำสั่ง /ตรวจ
 @bot.message_handler(func=lambda message: message.text and message.text.strip().startswith('/ตรวจ'))
 def handle_check_command(message):
     current_thread = str(getattr(message, 'message_thread_id', None))
-    
-    if TARGET_THREAD_ID:
-        if str(current_thread) != str(TARGET_THREAD_ID):
-            return
+    if TARGET_THREAD_ID and str(current_thread) != str(TARGET_THREAD_ID):
+        return
 
-    # เช็กดูว่ามีรูปสลิปถูกส่งมาก่อนหน้านี้ในห้องนี้ไหม
     if current_thread not in latest_photos_cache:
         bot.reply_to(message, "⚠️ ยังไม่พบรูปสลิปในห้องนี้ กรุณาส่งรูปสลิปมาก่อน แล้วค่อยพิมพ์ /ตรวจ ครับ")
         return
 
     file_id = latest_photos_cache[current_thread]
-    checking_msg = bot.reply_to(message, "⏳ กำลังตรวจสอบสลิปโอนเงินจากรูปที่ส่งมาก่อนหน้า...")
+    checking_msg = bot.reply_to(message, "⏳ กำลังตรวจสอบสลิปและค้นหาข้อมูลใน Google Sheet...")
     
     downloaded_file = None
     result = None
@@ -116,10 +164,7 @@ def handle_check_command(message):
             trans_ref = data.get('transRef') or data.get('ref1') or data.get('ref2')
             if trans_ref:
                 if trans_ref in used_slips_cache:
-                    reply_text = (
-                        f"❌ *ตรวจสอบสลิปไม่สำเร็จ*\n\n"
-                        f"• *สถานะสลิป:* แจ้งเตือน! สลิปนี้เคยถูกใช้งานไปแล้ว (สลิปซ้ำ)"
-                    )
+                    reply_text = "❌ *ตรวจสอบสลิปไม่สำเร็จ*\n\n• *สถานะสลิป:* แจ้งเตือน! สลิปนี้เคยถูกใช้งานไปแล้ว (สลิปซ้ำ)"
                     bot.delete_message(message.chat.id, checking_msg.message_id)
                     bot.reply_to(message, reply_text, parse_mode="Markdown")
                     return
@@ -132,8 +177,8 @@ def handle_check_command(message):
             sender = data.get('sender', {})
             receiver = data.get('receiver', {})
             
-            sender_name = sender.get('account', {}).get('name', {}).get('th', sender.get('name', 'ไม่ระบุ'))
-            receiver_name = receiver.get('account', {}).get('name', {}).get('th', receiver.get('name', 'ไม่ระบุ'))
+            sender_name = sender.get('account', {}).get('name', {}).get('th', sender.get('name', 'ไม่ระบุ')) if isinstance(sender.get('account', {}).get('name'), dict) else sender.get('name', 'ไม่ระบุ')
+            receiver_name = receiver.get('account', {}).get('name', {}).get('th', receiver.get('name', 'ไม่ระบุ')) if isinstance(receiver.get('account', {}).get('name'), dict) else receiver.get('name', 'ไม่ระบุ')
             
             sender_acc = sender.get('account', {}).get('bank', {}).get('account', sender.get('account', {}).get('number', 'ไม่ระบุ'))
             receiver_acc = receiver.get('account', {}).get('bank', {}).get('account', receiver.get('account', {}).get('number', 'ไม่ระบุ'))
@@ -148,9 +193,32 @@ def handle_check_command(message):
             raw_time = data.get('transTime', '')
             formatted_datetime = format_thai_datetime(raw_date, raw_time)
 
+            # ดึงเฉพาะเวลา HH:MM จาก EasySlip (เช่น 00:18)
+            slip_time_hm = raw_time[:5] if len(raw_time) >= 5 else ""
+
+            # ดึงข้อมูล Google Sheet และค้นหาความสอดคล้อง
+            df_sheet = fetch_google_sheet_data()
+            sheet_match, audit_status = match_sheet_row(df_sheet, amount, slip_time_hm)
+
+            # สร้างข้อความรายงาน
+            if audit_status == "ปกติ" and sheet_match:
+                status_icon = "🟢 *ปกติ*"
+                sheet_info_text = (
+                    f"📌 *ข้อมูลที่พบในตารางระบบ:*\n"
+                    f"• *ไอดีสมาชิก:* {sheet_match['user_id']}\n"
+                    f"• *ชื่อสมาชิก:* {sheet_match['username']}\n"
+                    f"• *ชื่อบัญชีในระบบ:* {sheet_match['acc_name']}\n"
+                    f"• *จำนวนเงิน:* {sheet_match['amount']} บาท\n"
+                    f"• *สถานะในระบบ:* {sheet_match['status']}\n"
+                    f"• *ผู้สร้าง/ผู้ตรวจสอบ:* {sheet_match['creator']} / {sheet_match['approver']}"
+                )
+            else:
+                status_icon = "🔴 *กรุณาตรวจสอบ*"
+                sheet_info_text = "⚠️ *ไม่พบรายการที่ยอดเงินและเวลาตรงกันในตารางระบบ*"
+
             reply_text = (
-                f"✅ *ตรวจสอบสลิปสำเร็จ*\n\n"
-                f"1. *สถานะสลิป:* สลิปจริง (ตรวจสอบผ่านระบบ QR Code)\n"
+                f"✅ *ผลการตรวจสอบสลิป*\n\n"
+                f"1. *สถานะสลิป:* สลิปจริง (ตรวจสอบผ่าน EasySlip)\n"
                 f"2. *วันที่และเวลา:* {formatted_datetime}\n"
                 f"3. *ชื่อบัญชีต้นทาง:* {sender_name}\n"
                 f"4. *เลขบัญชีต้นทาง:* {sender_acc}\n"
@@ -158,16 +226,15 @@ def handle_check_command(message):
                 f"6. *ชื่อบัญชีปลายทาง:* {receiver_name}\n"
                 f"7. *เลขบัญชีปลายทาง:* {receiver_acc}\n"
                 f"8. *ชื่อธนาคารปลายทาง:* {receiver_bank}\n"
-                f"9. *จำนวนเงิน:* {amount} บาท"
+                f"9. *จำนวนเงิน:* {amount} บาท\n\n"
+                f"📊 *ผลการเปรียบเทียบตารางหลังบ้าน:* {status_icon}\n"
+                f"{sheet_info_text}"
             )
         else:
             error_message = result.get("message", "อ่านสลิปไม่ได้หรือข้อมูลไม่ถูกต้อง")
-            reply_text = (
-                f"❌ *ตรวจสอบสลิปไม่สำเร็จ*\n\n"
-                f"• *สถานะสลิป:* สลิปปลอม / หรือ {error_message}"
-            )
-    except Exception:
-        reply_text = "⚠️ เกิดข้อผิดพลาดภายในระบบ"
+            reply_text = f"❌ *ตรวจสอบสลิปไม่สำเร็จ*\n\n• *สถานะสลิป:* สลิปปลอม / หรือ {error_message}"
+    except Exception as e:
+        reply_text = f"⚠️ เกิดข้อผิดพลาดภายในระบบ: {str(e)}"
     
     try:
         bot.delete_message(message.chat.id, checking_msg.message_id)
@@ -181,7 +248,6 @@ def handle_check_command(message):
     if result:
         del result
 
-# Webhook Endpoint
 @app.route('/webhook', methods=['POST'])
 def webhook():
     tg_secret = request.headers.get('X-Telegram-Bot-Api-Secret-Token')
@@ -198,7 +264,7 @@ def webhook():
 
 @app.route('/')
 def index():
-    return "Secure Slip Audit Bot (Separate Message) is running!"
+    return "Secure Slip Audit Bot with Full Sheet Search is running!"
 
 if __name__ == "__main__":
     if TELEGRAM_BOT_TOKEN and WEBHOOK_URL:
