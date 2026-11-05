@@ -12,6 +12,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 EASYSLIP_ACCESS_TOKEN = os.environ.get('EASYSLIP_ACCESS_TOKEN')
 WEBHOOK_URL = os.environ.get('WEBHOOK_URL')
 GOOGLE_SHEET_ID = os.environ.get('GOOGLE_SHEET_ID')
+GOOGLE_SHEET_NAME = os.environ.get('GOOGLE_SHEET_NAME', 'LOTTO365AUDIT')
 
 WEBHOOK_SECRET_TOKEN = secrets.token_hex(32)
 
@@ -40,18 +41,19 @@ def format_thai_datetime(date_str, time_str):
         pass
     return f"{date_str} {time_str}".strip()
 
+# ฟังก์ชันดึงข้อมูลระบุชื่อแท็บชีตโดยตรง
 def fetch_google_sheet_data():
     if not GOOGLE_SHEET_ID:
         return None
     try:
-        url = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/gviz/tq?tqx=out:csv&t={time.time()}"
+        url = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/gviz/tq?tqx=out:csv&sheet={GOOGLE_SHEET_NAME}&t={time.time()}"
         df = pd.read_csv(url)
+        print(f"DEBUG: Fetched sheet '{GOOGLE_SHEET_NAME}', total rows: {len(df)}")
         return df
     except Exception as e:
         print(f"Error fetching sheet: {e}")
         return None
 
-# ฟังก์ชันเทียบแถว พร้อมเก็บข้อมูลมาโชว์ใน Telegram เพื่อให้เห็นค่าที่บอทเทียบ
 def match_sheet_row(df, slip_amount, slip_time_hm):
     if df is None or df.empty:
         return None, "ไม่สามารถดึงข้อมูลจาก Google Sheet ได้"
@@ -73,7 +75,6 @@ def match_sheet_row(df, slip_amount, slip_time_hm):
             
             all_times = re.findall(r'(\d{2}:\d{2})', col_b_text)
             
-            # เก็บตัวอย่าง 3 แถวแรกที่บอทอ่านมาเพื่อเอาไว้แสดงผลดีบัก
             if len(checked_rows_preview) < 3:
                 checked_rows_preview.append(f"แถว {idx+2}: ยอด {sheet_amount} | เวลา {all_times}")
 
@@ -222,7 +223,7 @@ def handle_check_command(message):
             )
         else:
             error_message = result.get("message", "อ่านสลิปไม่ได้หรือข้อมูลไม่ถูกต้อง")
-            reply_text = f"❌ *ตรวจสอบสลิปไม่สำเร็จ*\n\n• *สถานะสลิป:* สลิปปลอม / หรือ {error_message}"
+            reply_text = f"❌ *ตรวจสอบสลิปไม่สำเร็จ*\n\n• *สถานะสลิป:* สลิปลอม / หรือ {error_message}"
     except Exception as e:
         reply_text = f"⚠️ เกิดข้อผิดพลาดภายในระบบ: {str(e)}"
     
@@ -254,7 +255,7 @@ def webhook():
 
 @app.route('/')
 def index():
-    return "Secure Slip Audit Bot (Debug Preview) is running!"
+    return "Secure Slip Audit Bot (Fixed Tab Name) is running!"
 
 if __name__ == "__main__":
     if TELEGRAM_BOT_TOKEN and WEBHOOK_URL:
