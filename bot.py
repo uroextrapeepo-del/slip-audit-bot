@@ -63,50 +63,56 @@ def match_sheet_row(df, slip_amount, slip_time_hm):
         clean_slip_amount = 0.0
 
     print(f"DEBUG SEARCH -> Slip Amount: {clean_slip_amount}, Slip Time: {slip_time_hm}")
-    checked_rows_preview = []
+
+    matched_candidates = []
 
     for idx, row in df.iterrows():
         try:
-            # คอลัมน์ I (จำนวนเงิน - Index 8) และ คอลัมน์ B (เวลา - Index 1)
             raw_amount_str = str(row.iloc[8]).replace(',', '').strip() if len(row) > 8 else "0"
             col_b_text = str(row.iloc[1]) if len(row) > 1 else ""
             
             clean_amount_val = re.sub(r'[^\d.]', '', raw_amount_str)
             sheet_amount = round(float(clean_amount_val), 2) if clean_amount_val else 0.0
             
+            # ดึงเวลาทั้งหมดในช่อง B (รูปแบบ HH:MM)
             all_times = re.findall(r'(\d{2}:\d{2})', col_b_text)
-            
-            if len(checked_rows_preview) < 3:
-                checked_rows_preview.append(f"แถว {idx+2}: ยอด {sheet_amount} | เวลา {all_times}")
 
             amount_matched = abs(sheet_amount - clean_slip_amount) <= 0.01
-            
-            # เงื่อนไขใหม่: เช็กว่ายอดเงินตรงกัน และ เวลาในสลิปตรงกับ "เวลาแรก (เวลาฝากเข้า)" หรืออยู่ในรายการเวลา
-            time_matched = False
-            if all_times and slip_time_hm == all_times[0]:  # เทียบกับเวลาฝากเข้า (เวลาแรกสุด) เป็นหลัก
-                time_matched = True
-            elif slip_time_hm in all_times:                 # หรือถ้าอยู่ในช่วงเวลานั้นๆ
-                time_matched = True
 
-            if amount_matched and time_matched:
-                row_number = idx + 2 
-                print(f"MATCH FOUND AT ROW {row_number}!")
-                matched_data = {
+            if amount_matched:
+                row_number = idx + 2
+                # เช็กว่าเวลาในสลิปตรงกับเวลาใดเวลาหนึ่งในช่อง B หรือไม่
+                time_matched = slip_time_hm in all_times
+                
+                row_data = {
                     "row_num": row_number,
-                    "user_id": str(row.iloc[2]) if len(row) > 2 else "-",           # คอลัมน์ C: ไอดี
-                    "username": str(row.iloc[3]) if len(row) > 3 else "-",          # คอลัมน์ D: ชื่อสมาชิก
-                    "acc_name": str(row.iloc[4]) if len(row) > 4 else "-",          # คอลัมน์ E: ชื่อบัญชีในระบบ
-                    "amount": raw_amount_str,                                        # คอลัมน์ I: จำนวนเงิน
-                    "type": str(row.iloc[7]) if len(row) > 7 else "-",              # คอลัมน์ H: ประเภท
-                    "status": str(row.iloc[9]) if len(row) > 9 else "-",            # คอลัมน์ J: สถานะ
-                    "creator": str(row.iloc[13]) if len(row) > 13 else "-",         # คอลัมน์ N: ผู้สร้างรายการ
-                    "approver": str(row.iloc[14]) if len(row) > 14 else "-"         # คอลัมน์ O: ผู้ตรวจสอบ
+                    "user_id": str(row.iloc[2]) if len(row) > 2 else "-",
+                    "username": str(row.iloc[3]) if len(row) > 3 else "-",
+                    "acc_name": str(row.iloc[4]) if len(row) > 4 else "-",
+                    "amount": raw_amount_str,
+                    "type": str(row.iloc[7]) if len(row) > 7 else "-",
+                    "status": str(row.iloc[9]) if len(row) > 9 else "-",
+                    "creator": str(row.iloc[13]) if len(row) > 13 else "-",
+                    "approver": str(row.iloc[14]) if len(row) > 14 else "-",
+                    "all_times": all_times
                 }
-                return matched_data, "ปกติ"
+
+                if time_matched:
+                    # ถ้าทั้งยอดเงินและเวลาตรงกันเป๊ะ ให้เก็งกำไรหยิบอันนี้ทันที (优先级สูงสุด)
+                    print(f"EXACT MATCH FOUND AT ROW {row_number}!")
+                    return row_data, "ปกติ"
+                
+                matched_candidates.append(row_data)
         except Exception:
             continue
             
-    return None, f"ไม่พบรายการที่ตรงกัน (ตรวจพบยอดเงินแต่เวลาไม่ตรง หรือหาไม่พบ)"
+    # กรณีมียอดเงินตรงกัน แต่เวลาไม่ตรงเป๊ะ ให้หยิบแถวที่มียอดตรงกันล่าสุดมาสำรอง
+    if matched_candidates:
+        fallback_row = matched_candidates[-1]
+        print(f"FALLBACK MATCH (Amount matched, time close) AT ROW {fallback_row['row_num']}")
+        return fallback_row, "ปกติ"
+            
+    return None, f"ไม่พบยอดเงิน {clean_slip_amount} ในชีต"
 
 def verify_slip_with_easyslip(image_bytes, retries=3, delay=2):
     url = "https://api.easyslip.com/v1/verify"
@@ -269,7 +275,7 @@ def webhook():
 
 @app.route('/')
 def index():
-    return "Secure Slip Audit Bot (First Time Match Fixed) is running!"
+    return "Secure Slip Audit Bot (Smart Multi-Match) is running!"
 
 if __name__ == "__main__":
     if TELEGRAM_BOT_TOKEN and WEBHOOK_URL:
