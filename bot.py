@@ -15,7 +15,6 @@ WEBHOOK_URL = os.environ.get('WEBHOOK_URL')
 
 TARGET_THREAD_ID = os.environ.get('TARGET_THREAD_ID') 
 
-# ตั้งค่า Google Sheet ID และ Sheet Name
 GOOGLE_SHEET_ID = os.environ.get('GOOGLE_SHEET_ID')
 GOOGLE_SHEET_NAME = os.environ.get('GOOGLE_SHEET_NAME', 'LOTTO365AUDIT')
 
@@ -27,7 +26,6 @@ app = Flask(__name__)
 used_slips_cache = set()
 latest_photos_cache = {}
 
-# แปลงวันที่-เวลา เป็น พ.ศ. DD/MM/YYYY HH:MM
 def format_thai_datetime(date_str, time_str):
     try:
         if 'T' in date_str:
@@ -47,7 +45,6 @@ def format_thai_datetime(date_str, time_str):
         pass
     return f"{date_str} {time_str}".strip()
 
-# ฟังก์ชันดึงข้อมูลทั้งหมดจาก Google Sheet ผ่าน CSV Export
 def fetch_google_sheet_data():
     if not GOOGLE_SHEET_ID:
         return None
@@ -59,32 +56,33 @@ def fetch_google_sheet_data():
         print(f"Error fetching sheet: {e}")
         return None
 
-# ฟังก์ชันค้นหาและจับคู่แถวใน Google Sheet
+# ฟังก์ชันเทียบแถว พร้อมระบุหมายเลขแถวในชีต
 def match_sheet_row(df, slip_amount, slip_time_hm):
     if df is None or df.empty:
         return None, "ไม่สามารถดึงข้อมูลจาก Google Sheet ได้"
     
-    # วนลูปตรวจทุกแถวใน Google Sheet (ไม่จำกัดจำนวนแถว)
     for idx, row in df.iterrows():
         try:
-            # 1. ตรวจสอบยอดเงิน (คอลัมน์ I / จำนวนเงิน)
+            # 1. ตรวจสอบจำนวนเงิน (คอลัมน์ I / Index 8)
             raw_amount = str(row.iloc[8]).replace(',', '').strip() if len(row) > 8 else "0"
             sheet_amount = float(raw_amount) if raw_amount.replace('.', '', 1).isdigit() else 0.0
             
             if abs(sheet_amount - float(slip_amount)) > 0.01:
-                continue # ยอดเงินไม่ตรง ข้ามไปแถวถัดไป
+                continue 
             
-            # 2. ตรวจสอบเวลาจากข้อความในคอลัมน์ B (เช่น ฝากเข้า05 พ.ย. 26 11:50:xx)
+            # 2. ตรวจสอบเวลาจากข้อความในคอลัมน์ B (Index 1)
             col_b_text = str(row.iloc[1]) if len(row) > 1 else ""
             
-            # ใช้ Regular Expression ดึงเวลา HH:MM เช่น 11:50 จากข้อความ
             time_match = re.search(r'(\d{2}:\d{2})', col_b_text)
             if time_match:
                 sheet_time_hm = time_match.group(1)
                 
-                # ถ้า ยอดเงินตรง และ เวลา (HH:MM) ตรงกันเป๊ะ
                 if sheet_time_hm == slip_time_hm:
+                    # คำนวณหมายเลขแถวใน Google Sheet (DataFrame เริ่ม index 0, แดชบอร์ดชีตมี Header แถว 1 ดังนั้น Index 0 = แถวที่ 2 ในชีต)
+                    row_number = idx + 2 
+                    
                     matched_data = {
+                        "row_num": row_number,                                           # หมายเลขแถวใน Google Sheet
                         "user_id": str(row.iloc[2]) if len(row) > 2 else "-",           # คอลัมน์ C: ไอดี
                         "username": str(row.iloc[3]) if len(row) > 3 else "-",          # คอลัมน์ D: ชื่อสมาชิก
                         "acc_name": str(row.iloc[4]) if len(row) > 4 else "-",          # คอลัมน์ E: ชื่อบัญชีในระบบ
@@ -92,7 +90,7 @@ def match_sheet_row(df, slip_amount, slip_time_hm):
                         "type": str(row.iloc[7]) if len(row) > 7 else "-",              # คอลัมน์ H: ประเภท
                         "status": str(row.iloc[9]) if len(row) > 9 else "-",            # คอลัมน์ J: สถานะ
                         "creator": str(row.iloc[13]) if len(row) > 13 else "-",         # คอลัมน์ N: ผู้สร้างรายการ
-                        "approver": str(row.iloc[14]) if len(row) > 14 else "-"          # คอลัมน์ O: ผู้ตรวจสอบ
+                        "approver": str(row.iloc[14]) if len(row) > 14 else "-"         # คอลัมน์ O: ผู้ตรวจสอบ
                     }
                     return matched_data, "ปกติ"
         except Exception:
@@ -100,7 +98,6 @@ def match_sheet_row(df, slip_amount, slip_time_hm):
             
     return None, "กรุณาตรวจสอบ"
 
-# ฟังก์ชันเรียก EasySlip API
 def verify_slip_with_easyslip(image_bytes, retries=3, delay=2):
     url = "https://api.easyslip.com/v1/verify"
     headers = {"Authorization": f"Bearer {EASYSLIP_ACCESS_TOKEN}"}
@@ -125,7 +122,6 @@ def verify_slip_with_easyslip(image_bytes, retries=3, delay=2):
                 del files
     return {"status": "error", "message": "Max retries reached"}
 
-# 1. ดักจับรูปสลิป
 @bot.message_handler(content_types=['photo'])
 def handle_incoming_photo(message):
     current_thread = str(getattr(message, 'message_thread_id', None))
@@ -135,7 +131,6 @@ def handle_incoming_photo(message):
     file_id = message.photo[-1].file_id
     latest_photos_cache[current_thread] = file_id
 
-# 2. ดักจับคำสั่ง /ตรวจ
 @bot.message_handler(func=lambda message: message.text and message.text.strip().startswith('/ตรวจ'))
 def handle_check_command(message):
     current_thread = str(getattr(message, 'message_thread_id', None))
@@ -193,24 +188,22 @@ def handle_check_command(message):
             raw_time = data.get('transTime', '')
             formatted_datetime = format_thai_datetime(raw_date, raw_time)
 
-            # ดึงเฉพาะเวลา HH:MM จาก EasySlip (เช่น 00:18)
             slip_time_hm = raw_time[:5] if len(raw_time) >= 5 else ""
 
-            # ดึงข้อมูล Google Sheet และค้นหาความสอดคล้อง
             df_sheet = fetch_google_sheet_data()
             sheet_match, audit_status = match_sheet_row(df_sheet, amount, slip_time_hm)
 
-            # สร้างข้อความรายงาน
             if audit_status == "ปกติ" and sheet_match:
                 status_icon = "🟢 *ปกติ*"
                 sheet_info_text = (
-                    f"📌 *ข้อมูลที่พบในตารางระบบ:*\n"
+                    f"📌 *ข้อมูลที่พบในตารางระบบ (แถวที่ {sheet_match['row_num']}):*\n"
                     f"• *ไอดีสมาชิก:* {sheet_match['user_id']}\n"
                     f"• *ชื่อสมาชิก:* {sheet_match['username']}\n"
                     f"• *ชื่อบัญชีในระบบ:* {sheet_match['acc_name']}\n"
                     f"• *จำนวนเงิน:* {sheet_match['amount']} บาท\n"
                     f"• *สถานะในระบบ:* {sheet_match['status']}\n"
-                    f"• *ผู้สร้าง/ผู้ตรวจสอบ:* {sheet_match['creator']} / {sheet_match['approver']}"
+                    f"• *ผู้สร้างรายการ:* {sheet_match['creator']}\n"
+                    f"• *ผู้ตรวจสอบ (ช่อง O):* {sheet_match['approver']}"
                 )
             else:
                 status_icon = "🔴 *กรุณาตรวจสอบ*"
@@ -264,7 +257,7 @@ def webhook():
 
 @app.route('/')
 def index():
-    return "Secure Slip Audit Bot with Full Sheet Search is running!"
+    return "Secure Slip Audit Bot with Row & Approver info is running!"
 
 if __name__ == "__main__":
     if TELEGRAM_BOT_TOKEN and WEBHOOK_URL:
