@@ -49,43 +49,51 @@ def fetch_google_sheet_data():
     if not GOOGLE_SHEET_ID:
         return None
     try:
-        url = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/gviz/tq?tqx=out:csv&sheet={GOOGLE_SHEET_NAME}"
+        # เติมพารามิเตอร์รันไทม์สุ่มเพื่อป้องกันติด CSV Cache ของ Google Sheet
+        url = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/gviz/tq?tqx=out:csv&sheet={GOOGLE_SHEET_NAME}&t={time.time()}"
         df = pd.read_csv(url)
         return df
     except Exception as e:
         print(f"Error fetching sheet: {e}")
         return None
 
-# ฟังก์ชันเทียบแถวที่ปรับปรุงการตัดเวลาจากคอลัมน์ B ให้แม่นยำยิ่งขึ้น
+# ฟังก์ชันเทียบแถวที่ปรับปรุงการอ่านจำนวนเงินให้แม่นยำไร้ที่ติ
 def match_sheet_row(df, slip_amount, slip_time_hm):
     if df is None or df.empty:
         return None, "ไม่สามารถดึงข้อมูลจาก Google Sheet ได้"
     
+    # แปลงยอดเงินจากสลิปให้เป็นตัวเลขกลมๆ หรือทศนิยมสองตำแหน่งที่แน่นอน
+    try:
+        clean_slip_amount = round(float(slip_amount), 2)
+    except Exception:
+        clean_slip_amount = 0.0
+
     for idx, row in df.iterrows():
         try:
-            # 1. ตรวจสอบจำนวนเงิน (คอลัมน์ I / Index 8)
-            raw_amount = str(row.iloc[8]).replace(',', '').strip() if len(row) > 8 else "0"
-            sheet_amount = float(raw_amount) if raw_amount.replace('.', '', 1).isdigit() else 0.0
+            # 1. ตรวจสอบจำนวนเงิน (คอลัมน์ I / Index 8) - ทำความสะอาดตัวอักษรและคอมมาออกให้หมด
+            raw_amount_str = str(row.iloc[8]).replace(',', '').strip() if len(row) > 8 else "0"
+            sheet_amount = round(float(raw_amount_str), 2) if raw_amount_str.replace('.', '', 1).isdigit() else 0.0
             
-            if abs(sheet_amount - float(slip_amount)) > 0.01:
+            # เปรียบเทียบยอดเงินว่าตรงกันไหม (ยอมรับความคลาดเคลื่อนไม่เกิน 0.01)
+            if abs(sheet_amount - clean_slip_amount) > 0.01:
                 continue 
             
-            # 2. ตรวจสอบเวลาจากข้อความในคอลัมน์ B (Index 1) เช่น 'ฝากเข้า05 พ.ย. 26 00:18:xx'
+            # 2. ตรวจสอบเวลาจากข้อความในคอลัมน์ B (Index 1)
             col_b_text = str(row.iloc[1]) if len(row) > 1 else ""
             
-            # ค้นหาแพทเทิร์นเวลา HH:MM ทั้งหมดที่ซ่อนอยู่ในข้อความคอลัมน์ B
+            # ค้นหาเวลาในรูปแบบ HH:MM ทั้งหมดในช่องนั้น
             all_times = re.findall(r'(\d{2}:\d{2})', col_b_text)
             
-            # เช็กว่ามีเวลาตัวไหนในช่องนั้นตรงกับเวลาในสลิป (slip_time_hm เช่น 00:18) หรือไม่
+            # ถ้าเวลา HH:MM ตรงกัน
             if slip_time_hm in all_times:
-                row_number = idx + 2 # แปลงเป็นหมายเลขแถวใน Google Sheet จริง
+                row_number = idx + 2 # หมายเลขแถวใน Google Sheet จริง
                 
                 matched_data = {
                     "row_num": row_number,
                     "user_id": str(row.iloc[2]) if len(row) > 2 else "-",           # คอลัมน์ C: ไอดี
                     "username": str(row.iloc[3]) if len(row) > 3 else "-",          # คอลัมน์ D: ชื่อสมาชิก
                     "acc_name": str(row.iloc[4]) if len(row) > 4 else "-",          # คอลัมน์ E: ชื่อบัญชีในระบบ
-                    "amount": raw_amount,                                            # คอลัมน์ I: จำนวนเงิน
+                    "amount": raw_amount_str,                                        # คอลัมน์ I: จำนวนเงิน
                     "type": str(row.iloc[7]) if len(row) > 7 else "-",              # คอลัมน์ H: ประเภท
                     "status": str(row.iloc[9]) if len(row) > 9 else "-",            # คอลัมน์ J: สถานะ
                     "creator": str(row.iloc[13]) if len(row) > 13 else "-",         # คอลัมน์ N: ผู้สร้างรายการ
@@ -256,7 +264,7 @@ def webhook():
 
 @app.route('/')
 def index():
-    return "Secure Slip Audit Bot with Fixed Regex Time Matching is running!"
+    return "Secure Slip Audit Bot with Anti-Cache Sheet Sync is running!"
 
 if __name__ == "__main__":
     if TELEGRAM_BOT_TOKEN and WEBHOOK_URL:
