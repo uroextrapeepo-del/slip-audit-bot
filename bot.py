@@ -14,9 +14,7 @@ EASYSLIP_ACCESS_TOKEN = os.environ.get('EASYSLIP_ACCESS_TOKEN')
 WEBHOOK_URL = os.environ.get('WEBHOOK_URL')
 
 TARGET_THREAD_ID = os.environ.get('TARGET_THREAD_ID') 
-
 GOOGLE_SHEET_ID = os.environ.get('GOOGLE_SHEET_ID')
-GOOGLE_SHEET_NAME = os.environ.get('GOOGLE_SHEET_NAME', 'LOTTO365AUDIT')
 
 WEBHOOK_SECRET_TOKEN = secrets.token_hex(32)
 
@@ -45,18 +43,22 @@ def format_thai_datetime(date_str, time_str):
         pass
     return f"{date_str} {time_str}".strip()
 
+# ฟังก์ชันดึงข้อมูลจากแผ่นงานแรกสุดโดยอัตโนมัติ
 def fetch_google_sheet_data():
     if not GOOGLE_SHEET_ID:
+        print("DEBUG: GOOGLE_SHEET_ID is missing!")
         return None
     try:
-        url = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/gviz/tq?tqx=out:csv&sheet={GOOGLE_SHEET_NAME}&t={time.time()}"
+        # ไม่ระบุชื่อ sheet เพื่อให้ Google ส่งออกข้อมูลจากแท็บแรกสุดของไฟล์โดยอัตโนมัติ
+        url = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/gviz/tq?tqx=out:csv&t={time.time()}"
         df = pd.read_csv(url)
+        print(f"DEBUG: Successfully fetched sheet, total rows: {len(df)}")
         return df
     except Exception as e:
         print(f"Error fetching sheet: {e}")
         return None
 
-# ฟังก์ชันเทียบแถว พร้อมระบบพิมพ์ Debug ลง Log เพื่อตรวจสอบค่าที่บอทอ่านได้
+# ฟังก์ชันค้นหาและเทียบแถว พร้อมระบบพิมพ์ Log ละเอียด
 def match_sheet_row(df, slip_amount, slip_time_hm):
     if df is None or df.empty:
         print("DEBUG: DataFrame is empty or None")
@@ -71,22 +73,18 @@ def match_sheet_row(df, slip_amount, slip_time_hm):
 
     for idx, row in df.iterrows():
         try:
-            # ดึงค่าคอลัมน์ I (จำนวนเงิน - Index 8) และ คอลัมน์ B (เวลา - Index 1)
             raw_amount_str = str(row.iloc[8]).replace(',', '').strip() if len(row) > 8 else "0"
             col_b_text = str(row.iloc[1]) if len(row) > 1 else ""
             
-            # ทำความสะอาดตัวเลขจำนวนเงิน
             clean_amount_val = re.sub(r'[^\d.]', '', raw_amount_str)
             sheet_amount = round(float(clean_amount_val), 2) if clean_amount_val else 0.0
             
-            # ค้นหาเวลา HH:MM ในข้อความคอลัมน์ B
             all_times = re.findall(r'(\d{2}:\d{2})', col_b_text)
             
-            # พิมพ์ข้อมูลทุกแถวที่กำลังเช็กขึ้น Render Logs เพื่อดูว่าอ่านค่าได้ถูกต้องไหม
-            if idx < 30: # ป้องกัน Log ยาวเกินไป พิมพ์ดู 30 แถวแรก
-                print(f"Row {idx+2} | Col B: '{col_b_text}' | Times Found: {all_times} | Amount: {sheet_amount}")
+            # พิมพ์ข้อมูล 30 แถวแรกขึ้น Render Logs เพื่อให้เราเห็นค่าจริงที่บอทอ่าน
+            if idx < 30:
+                print(f"Row {idx+2} | Col B: '{col_b_text}' | Times: {all_times} | Amount: {sheet_amount}")
 
-            # เช็กเงื่อนไข: ยอดเงินตรงกัน และ มีเวลา HH:MM ตรงกัน
             amount_matched = abs(sheet_amount - clean_slip_amount) <= 0.01
             time_matched = slip_time_hm in all_times
 
@@ -271,7 +269,7 @@ def webhook():
 
 @app.route('/')
 def index():
-    return "Secure Slip Audit Bot with Detailed Log Debug is running!"
+    return "Secure Slip Audit Bot (Auto First Sheet) is running!"
 
 if __name__ == "__main__":
     if TELEGRAM_BOT_TOKEN and WEBHOOK_URL:
