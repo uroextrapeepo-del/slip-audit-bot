@@ -64,8 +64,6 @@ def match_sheet_row(df, slip_amount, slip_time_hm):
 
     print(f"DEBUG SEARCH -> Slip Amount: {clean_slip_amount}, Slip Time: {slip_time_hm}")
 
-    matched_candidates = []
-
     for idx, row in df.iterrows():
         try:
             raw_amount_str = str(row.iloc[8]).replace(',', '').strip() if len(row) > 8 else "0"
@@ -74,22 +72,21 @@ def match_sheet_row(df, slip_amount, slip_time_hm):
             clean_amount_val = re.sub(r'[^\d.]', '', raw_amount_str)
             sheet_amount = round(float(clean_amount_val), 2) if clean_amount_val else 0.0
             
-            # --- เทคนิคดึงเวลาตามคำสั่งเจ้านาย ---
-            # ตัดช่องว่างออกทั้งหมด แล้วตัดตัวอักษรตำแหน่งที่ 10-14 (Index 10 ถึง 15)
+            # ตัดช่องว่างทั้งหมด แล้วดึงตำแหน่งตัวอักษรที่ 10 ถึง 15 (ช่วงเวลาฝากเข้า) ตามที่เจ้านายแนะนำ
             col_b_nospace = col_b_text.replace(" ", "")
             sheet_time_extracted = col_b_nospace[10:15] if len(col_b_nospace) >= 15 else ""
             
-            # ดึงเวลาสำรองทั้งหมดในข้อความเก็บไว้เปรียบเทียบ
+            # ดึงเวลาทั้งหมดในช่อง B ไว้เช็กสำรองด้วย
             all_times_in_cell = re.findall(r'(\d{2}:\d{2})', col_b_text)
 
             amount_matched = abs(sheet_amount - clean_slip_amount) <= 0.01
+            
+            # เงื่อนไขเวลาต้องตรงเป๊ะจริงๆ เท่านั้น (ไม่เอาFallback มั่วซั่ว)
+            time_matched = (slip_time_hm == sheet_time_extracted) or (slip_time_hm in all_times_in_cell)
 
-            if amount_matched:
+            if amount_matched and time_matched:
                 row_number = idx + 2
-                
-                # เช็กเวลา: ตรงกับเวลาตำแหน่ง 10-14 หรือ ตรงกับเวลาในช่อง B หรือไม่
-                time_matched = (slip_time_hm == sheet_time_extracted) or (slip_time_hm in all_times_in_cell)
-                
+                print(f"EXACT MATCH FOUND AT ROW {row_number} (Time: {slip_time_hm})!")
                 row_data = {
                     "row_num": row_number,
                     "user_id": str(row.iloc[2]) if len(row) > 2 else "-",
@@ -100,24 +97,13 @@ def match_sheet_row(df, slip_amount, slip_time_hm):
                     "status": str(row.iloc[9]) if len(row) > 9 else "-",
                     "creator": str(row.iloc[13]) if len(row) > 13 else "-",
                     "approver": str(row.iloc[14]) if len(row) > 14 else "-",
-                    "sheet_time": sheet_time_extracted
                 }
-
-                if time_matched:
-                    print(f"EXACT TIME MATCH ({slip_time_hm} == {sheet_time_extracted}) AT ROW {row_number}!")
-                    return row_data, "ปกติ"
-                
-                matched_candidates.append(row_data)
+                return row_data, "ปกติ"
         except Exception:
             continue
             
-    # กรณีมียอดเงินตรงกัน แต่เวลาไม่ตรงเป๊ะ ให้หยิบแถวที่มียอดตรงกันล่าสุดมาสำรอง
-    if matched_candidates:
-        fallback_row = matched_candidates[-1]
-        print(f"FALLBACK MATCH AT ROW {fallback_row['row_num']}")
-        return fallback_row, "ปกติ"
-            
-    return None, f"ไม่พบยอดเงิน {clean_slip_amount} ในชีต"
+    # ตัดระบบ Fallback ออก ป้องกันการดึงสลับแถวเด็ดขาด!
+    return None, f"ไม่พบรายการที่ยอด ({clean_slip_amount}) และเวลา ({slip_time_hm}) ตรงกันเป๊ะในชีต"
 
 def verify_slip_with_easyslip(image_bytes, retries=3, delay=2):
     url = "https://api.easyslip.com/v1/verify"
@@ -165,7 +151,7 @@ def handle_check_command(message):
         return
 
     file_id = latest_photos_cache[chat_id]
-    checking_msg = bot.reply_to(message, "⏳ กำลังตรวจสอบสลิปและค้นหาข้อมูลใน Google Sheet...")
+    checking_msg = bot.reply_to(message, "⏳ กำลังตรวจสอบสลิปและเทียบเวลาแบบเป๊ะๆ...")
     
     downloaded_file = None
     result = None
@@ -217,7 +203,7 @@ def handle_check_command(message):
             sheet_match, audit_status = match_sheet_row(df_sheet, amount, slip_time_hm)
 
             if audit_status == "ปกติ" and sheet_match:
-                status_icon = "🟢 *ปกติ*"
+                status_icon = "🟢 *ปกติ (MATCH)*"
                 sheet_info_text = (
                     f"📌 *ข้อมูลที่พบในตารางระบบ (แถวที่ {sheet_match['row_num']}):*\n"
                     f"• *ไอดีสมาชิก:* {sheet_match['user_id']}\n"
@@ -233,7 +219,7 @@ def handle_check_command(message):
                 sheet_info_text = f"⚠️ *ไม่พบรายการที่ตรงกัน* ({audit_status})"
 
             reply_text = (
-                f"✅ *ผลการตรวจสอบสลิป*\n\n"
+                f"✅ *ผลการตรวจสอบสลิป MATCH*\n\n"
                 f"1. *สถานะสลิป:* สลิปจริง (ตรวจสอบผ่าน EasySlip)\n"
                 f"2. *วันที่และเวลา:* {formatted_datetime}\n"
                 f"3. *ชื่อบัญชีต้นทาง:* {sender_name}\n"
@@ -280,7 +266,7 @@ def webhook():
 
 @app.route('/')
 def index():
-    return "Secure Slip Audit Bot (Indexed Time Slice) is running!"
+    return "Secure Slip Audit Bot (Strict Exact Match Only) is running!"
 
 if __name__ == "__main__":
     if TELEGRAM_BOT_TOKEN and WEBHOOK_URL:
