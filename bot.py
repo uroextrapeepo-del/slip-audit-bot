@@ -41,13 +41,22 @@ def format_thai_datetime(date_str, time_str):
         pass
     return f"{date_str} {time_str}".strip()
 
+# ฟังก์ชันดึงข้อมูลชีต พร้อมจัดเรียงไอดี (คอลัมน์ C) จากน้อยไปมาก
 def fetch_google_sheet_data():
     if not GOOGLE_SHEET_ID:
         return None
     try:
         url = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/export?format=csv&gid={GOOGLE_SHEET_GID}&t={time.time()}"
         df = pd.read_csv(url)
-        print(f"DEBUG: Successfully fetched CSV export via gid={GOOGLE_SHEET_GID}, total rows: {len(df)}")
+        
+        # จัดเรียงข้อมูลตามไอดีในคอลัมน์ C (Index 2) จากน้อยไปมาก
+        if len(df.columns) > 2:
+            col_c_name = df.columns[2]
+            # แปลงเป็นตัวเลขเพื่อเรียงลำดับที่ถูกต้อง (ถ้ามีตัวอักษรปนให้แปลงเป็น NaN แล้วดันไปข้างหลัง)
+            df['numeric_id'] = pd.to_numeric(df[col_c_name], errors='coerce')
+            df = df.sort_values(by='numeric_id', ascending=True).drop(columns=['numeric_id'])
+            print(f"DEBUG: Successfully fetched & sorted sheet by ID (Col C) ascending, total rows: {len(df)}")
+            
         return df
     except Exception as e:
         print(f"Error fetching sheet: {e}")
@@ -62,8 +71,6 @@ def match_sheet_row(df, slip_amount, slip_time_hm):
     except Exception:
         clean_slip_amount = 0.0
 
-    print(f"DEBUG SEARCH -> Slip Amount: {clean_slip_amount}, Slip Time: {slip_time_hm}")
-
     matched_candidates = []
 
     for idx, row in df.iterrows():
@@ -74,14 +81,11 @@ def match_sheet_row(df, slip_amount, slip_time_hm):
             clean_amount_val = re.sub(r'[^\d.]', '', raw_amount_str)
             sheet_amount = round(float(clean_amount_val), 2) if clean_amount_val else 0.0
             
-            # ดึงเวลาทั้งหมดในช่อง B (รูปแบบ HH:MM)
             all_times = re.findall(r'(\d{2}:\d{2})', col_b_text)
-
             amount_matched = abs(sheet_amount - clean_slip_amount) <= 0.01
 
             if amount_matched:
                 row_number = idx + 2
-                # เช็กว่าเวลาในสลิปตรงกับเวลาใดเวลาหนึ่งในช่อง B หรือไม่
                 time_matched = slip_time_hm in all_times
                 
                 row_data = {
@@ -98,19 +102,14 @@ def match_sheet_row(df, slip_amount, slip_time_hm):
                 }
 
                 if time_matched:
-                    # ถ้าทั้งยอดเงินและเวลาตรงกันเป๊ะ ให้เก็งกำไรหยิบอันนี้ทันที (优先级สูงสุด)
-                    print(f"EXACT MATCH FOUND AT ROW {row_number}!")
                     return row_data, "ปกติ"
                 
                 matched_candidates.append(row_data)
         except Exception:
             continue
             
-    # กรณีมียอดเงินตรงกัน แต่เวลาไม่ตรงเป๊ะ ให้หยิบแถวที่มียอดตรงกันล่าสุดมาสำรอง
     if matched_candidates:
-        fallback_row = matched_candidates[-1]
-        print(f"FALLBACK MATCH (Amount matched, time close) AT ROW {fallback_row['row_num']}")
-        return fallback_row, "ปกติ"
+        return matched_candidates[-1], "ปกติ"
             
     return None, f"ไม่พบยอดเงิน {clean_slip_amount} ในชีต"
 
@@ -160,15 +159,31 @@ def handle_check_command(message):
         return
 
     file_id = latest_photos_cache[chat_id]
-    checking_msg = bot.reply_to(message, "⏳ กำลังตรวจสอบสลิปและค้นหาข้อมูลใน Google Sheet...")
+    checking_msg = bot.reply_to(message, "⏳ กำลังดึงข้อมูลจากไดร์ฟและตรวจสอบสลิป...")
     
     downloaded_file = None
     result = None
     
     try:
+        # 1. ดึงข้อมูลจาก Google Sheet มาก่อน (เรียงไอดีน้อยไปมากแล้ว)
+        df_sheet = fetch_google_sheet_data()
+        
+        # ส่งข้อมูลสรุปจากไดร์ฟให้ดูก่อนตามต้องการ
+        if df_sheet is not None and not df_sheet.empty:
+            total_rows = len(df_sheet)
+            first_id = str(df_sheet.iloc[0].iloc[2]) if len(df_sheet.columns) > 2 else "-"
+            last_id = str(df_sheet.iloc[-1].iloc[2]) if len(df_sheet.columns) > 2 else "-"
+            drive_info_msg = (
+                f"📂 *ข้อมูลจาก Google Drive (เรียงไอดีจากน้อยไปมาก):*\n"
+                f"• จำนวนแถวทั้งหมด: {total_rows} แถว\n"
+                f"• ไอดีเริ่มต้น (น้อยสุด): {first_id}\n"
+                f"• ไอดีล่าสุด (มากสุด): {last_id}"
+            )
+            bot.send_message(chat_id, drive_info_msg, parse_mode="Markdown")
+
+        # 2. ตรวจสอบสลิปผ่าน EasySlip
         file_info = bot.get_file(file_id)
         downloaded_file = bot.download_file(file_info.file_path)
-        
         result = verify_slip_with_easyslip(downloaded_file)
 
         if result.get("status") == 200 or result.get("status") == "success":
@@ -208,11 +223,11 @@ def handle_check_command(message):
 
             slip_time_hm = raw_time[:5] if len(raw_time) >= 5 else ""
 
-            df_sheet = fetch_google_sheet_data()
+            # 3. เทียบข้อมูลสลิปกับตารางที่เรียงแล้ว
             sheet_match, audit_status = match_sheet_row(df_sheet, amount, slip_time_hm)
 
             if audit_status == "ปกติ" and sheet_match:
-                status_icon = "🟢 *ปกติ*"
+                status_icon = "🟢 *ปกติ (MATCH)*"
                 sheet_info_text = (
                     f"📌 *ข้อมูลที่พบในตารางระบบ (แถวที่ {sheet_match['row_num']}):*\n"
                     f"• *ไอดีสมาชิก:* {sheet_match['user_id']}\n"
@@ -228,7 +243,7 @@ def handle_check_command(message):
                 sheet_info_text = f"⚠️ *ไม่พบรายการที่ตรงกัน* ({audit_status})"
 
             reply_text = (
-                f"✅ *ผลการตรวจสอบสลิป*\n\n"
+                f"✅ *ผลการตรวจสอบสลิป MATCH*\n\n"
                 f"1. *สถานะสลิป:* สลิปจริง (ตรวจสอบผ่าน EasySlip)\n"
                 f"2. *วันที่และเวลา:* {formatted_datetime}\n"
                 f"3. *ชื่อบัญชีต้นทาง:* {sender_name}\n"
@@ -275,7 +290,7 @@ def webhook():
 
 @app.route('/')
 def index():
-    return "Secure Slip Audit Bot (Smart Multi-Match) is running!"
+    return "Secure Slip Audit Bot (Sorted ID & Drive First) is running!"
 
 if __name__ == "__main__":
     if TELEGRAM_BOT_TOKEN and WEBHOOK_URL:
